@@ -357,20 +357,26 @@ func (u *appUI) save() {
 // ── Add Section dialog ────────────────────────────────────────────────────────
 
 // showAddSectionDialog opens a form where the user names a new section.
+//
+// Why dialog.NewCustomConfirm instead of dialog.ShowForm?
+// dialog.ShowForm sizes each widget column to its minimum width — for an empty
+// Entry that is very narrow.  dialog.NewCustomConfirm returns a Dialog value
+// that exposes Resize(), so we can force a sensible width before Show().
 func (u *appUI) showAddSectionDialog() {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("e.g. alias, push, pull")
 
 	subEntry := widget.NewEntry()
-	subEntry.SetPlaceHolder(`e.g. lfs  (leave blank for none)`)
+	subEntry.SetPlaceHolder("e.g. lfs  (leave blank for none)")
 
-	items := []*widget.FormItem{
-		{Text: "Section name", Widget: nameEntry},
-		{Text: "Subsection (optional)", Widget: subEntry},
-	}
+	// widget.NewForm lays out FormItems in a two-column label/widget grid and
+	// stretches the widget column to fill available horizontal space.
+	form := widget.NewForm(
+		widget.NewFormItem("Section name", nameEntry),
+		widget.NewFormItem("Subsection (optional)", subEntry),
+	)
 
-	// dialog.ShowForm shows a modal form dialog with OK/Cancel buttons.
-	dialog.ShowForm("Add Section", "Add", "Cancel", items, func(confirmed bool) {
+	d := dialog.NewCustomConfirm("Add Section", "Add", "Cancel", form, func(confirmed bool) {
 		if !confirmed {
 			return
 		}
@@ -396,6 +402,10 @@ func (u *appUI) showAddSectionDialog() {
 		u.sectionList.Select(newDisplayIdx)
 		u.status(fmt.Sprintf("Added [%s].", sectionLabel(config.Section{Name: name, Subsection: sub})))
 	}, u.window)
+
+	// Resize before Show — the entries now stretch to fill the 420 pt width.
+	d.Resize(fyne.NewSize(420, 180))
+	d.Show()
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────

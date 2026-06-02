@@ -134,7 +134,9 @@ func buildEntryRow(sec *config.Section, idx int, e *config.Entry, onChange func(
 	)
 }
 
-// showAddEntryDialog opens a small form for a new key=value pair.
+// showAddEntryDialog opens a form for a new key=value pair.
+// Uses the same dialog.NewCustomConfirm + Resize pattern as showAddSectionDialog
+// so the entry fields are a comfortable width.
 func showAddEntryDialog(sec *config.Section, onChange func()) {
 	keyEntry := widget.NewEntry()
 	keyEntry.SetPlaceHolder("e.g. name, email, signingkey")
@@ -142,17 +144,16 @@ func showAddEntryDialog(sec *config.Section, onChange func()) {
 	valueEntry := widget.NewEntry()
 	valueEntry.SetPlaceHolder("e.g. KnightYoshi")
 
-	items := []*widget.FormItem{
-		{Text: "Key", Widget: keyEntry},
-		{Text: "Value", Widget: valueEntry},
-	}
+	form := widget.NewForm(
+		widget.NewFormItem("Key", keyEntry),
+		widget.NewFormItem("Value", valueEntry),
+	)
 
 	// We need the Fyne window to attach the dialog to; we grab it from the
-	// canvas of any existing widget. In a larger app you'd pass the window
-	// explicitly — here the canvas approach is the simplest path.
+	// driver's window list. In a larger app you'd pass the window explicitly.
 	w := fyne.CurrentApp().Driver().AllWindows()[0]
 
-	dialog.ShowForm("Add Entry", "Add", "Cancel", items, func(confirmed bool) {
+	d := dialog.NewCustomConfirm("Add Entry", "Add", "Cancel", form, func(confirmed bool) {
 		if !confirmed {
 			return
 		}
@@ -164,6 +165,9 @@ func showAddEntryDialog(sec *config.Section, onChange func()) {
 		sec.Entries = append(sec.Entries, config.Entry{Key: key, Value: value})
 		onChange()
 	}, w)
+
+	d.Resize(fyne.NewSize(420, 180))
+	d.Show()
 }
 
 // ── Include section editor ────────────────────────────────────────────────────
