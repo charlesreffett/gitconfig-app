@@ -1,16 +1,24 @@
-// Package ui implements the Fyne desktop interface for Git Config Manager.
+// Package ui is the top-level package for the Git Config Manager desktop UI.
 //
-// # How Fyne works (short primer)
+// # Architecture overview
 //
-// Fyne is a Go GUI framework. You build a UI by composing "widgets" (Button,
-// Label, Entry, List…) inside "containers" (VBox, HBox, HSplit, Border…).
-// Containers arrange their children according to a layout rule.
+// The application shows three panels side by side:
 //
-// Key rules:
-//  1. All UI code runs on the main goroutine. Fyne enforces this.
-//  2. After changing a widget's data, call widget.Refresh() to repaint.
-//  3. app.NewWindow(...).ShowAndRun() is the event loop — it blocks until the
-//     window is closed.
+//	[Library (200pt)] | [Global Config Canvas] | [Project Config Canvas]
+//
+// The library panel (left) lets users drag or click block templates to add them
+// to a config canvas. Each canvas is an independent scrollable area that holds
+// an ordered list of block widgets representing one gitconfig file's structure.
+//
+// Blocks are visual cards:
+//   - SectionBlock     — [user], [core], [alias], etc.
+//   - FileBlock        — an included config file ([include] path)
+//   - ConditionalBlock — a conditional include ([includeIf "gitdir:…"])
+//   - CustomBlock      — unknown sections not in the schema registry
+//
+// When both a global and a project config are loaded, the app highlights keys
+// in the global config that are overridden by the project config ("superseded"
+// fields are rendered in a dimmed style).
 package ui
 
 import (
@@ -27,413 +35,456 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/knightyoshi/git-config-manager/internal/config"
+	"github.com/knightyoshi/git-config-manager/internal/schema"
+	"github.com/knightyoshi/git-config-manager/internal/ui/blocks"
+	uicanvas "github.com/knightyoshi/git-config-manager/internal/ui/canvas"
+	"github.com/knightyoshi/git-config-manager/internal/ui/library"
 )
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-// Run loads the gitconfig at mainConfigPath and opens the application window.
-// It blocks until the user closes the window.
+// Run is the public entry point called by main.go.
+// It creates the Fyne application, loads the global config, and shows the window.
+// This function blocks until the user closes the window.
 func Run(mainConfigPath string) {
-	// app.NewWithID creates the Fyne application. The ID is a reverse-domain
-	// string used by the OS to identify the app (for preferences, dock, etc.)
+	// app.NewWithID creates the Fyne application with a unique reverse-domain ID.
+	// The ID is used by the OS for preferences, dock icons, etc.
 	a := app.NewWithID("com.knightyoshi.gitconfigmanager")
 
-	w := a.NewWindow("Git Config Manager")
-	w.Resize(fyne.NewSize(960, 640))
+	w := a.NewWindow("Git Config Manager — Visual Block Editor")
+	w.Resize(fyne.NewSize(1200, 740))
 
-	u := newAppUI(w)
-	if err := u.pushConfig(mainConfigPath); err != nil {
-		// If we can't read the config, show an error dialog before starting.
-		// dialog.ShowError is non-blocking — it creates a modal over the window.
-		dialog.ShowError(fmt.Errorf("could not load %s:\n%w", mainConfigPath, err), w)
+	ui := newAppUI(a, w)
+
+	// Load the global gitconfig on startup. Show a non-fatal error dialog if
+	// the file cannot be read (e.g. it doesn't exist yet on a fresh machine).
+	if err := ui.loadGlobal(mainConfigPath); err != nil {
+		dialog.ShowError(
+			fmt.Errorf("could not load %s:\n%w", mainConfigPath, err),
+			w,
+		)
 	}
 
-	// SetContent replaces the window's root widget. Must be called before
-	// ShowAndRun so the first frame is painted correctly.
-	w.SetContent(u.buildLayout())
-
-	// ShowAndRun makes the window visible and starts the Fyne event loop.
-	// Nothing after this line runs until the window is closed.
+	w.SetContent(ui.buildLayout())
 	w.ShowAndRun()
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
 
-// appUI owns all mutable state and the widget references we need to update
-// programmatically (i.e., after user actions that change the data model).
-//
-// In Go, structs are the primary way to bundle related data. This one acts
-// like a "view model" — the single source of truth for what the window shows.
+// appUI owns all mutable UI state. It wires together the three panels and
+// manages the global/project config lifecycle.
 type appUI struct {
-	window fyne.Window
+	fyneApp fyne.App
+	window  fyne.Window
 
-	// configStack implements breadcrumb navigation.
-	//
-	// [0] is always the root ~/.gitconfig.
-	// When the user clicks "Open linked file" on an includeIf section, the
-	// linked config is parsed and pushed here.
-	// The Back button pops the stack.
-	configStack []*config.Config
+	// globalCanvas is the left config canvas showing ~/.gitconfig.
+	globalCanvas *uicanvas.ConfigCanvas
+	// globalPath is the absolute path to the global config file.
+	globalPath string
+	// globalCfg is the last parsed global config (used for superseded-key comparison).
+	globalCfg *config.Config
 
-	// selectedDisplay is the index inside visibleSections() the user has
-	// clicked in the sidebar. -1 means nothing is selected.
-	selectedDisplay int
+	// projectCanvas is the right config canvas showing <repo>/.git/config.
+	projectCanvas *uicanvas.ConfigCanvas
+	// projectPath is the absolute path to the currently loaded project config.
+	projectPath string
 
-	// These widget pointers let us refresh specific parts of the UI without
-	// rebuilding the whole layout from scratch.
-	sectionList  *widget.List    // sidebar list
-	editorHolder *fyne.Container // wraps the right-side editor; we swap its contents
-	pathLabel    *widget.Label   // shows the current file path in the toolbar
-	statusLabel  *widget.Label   // bottom status bar
-	backBtn      *widget.Button  // enabled only when configStack has >1 entry
+	// saveGlobalBtn and saveProjectBtn are kept as fields so we can enable/
+	// disable them programmatically.
+	saveGlobalBtn  *widget.Button
+	saveProjectBtn *widget.Button
+
+	// statusLabel is the bottom status bar.
+	statusLabel *widget.Label
 }
 
-func newAppUI(w fyne.Window) *appUI {
-	return &appUI{
-		window:          w,
-		selectedDisplay: -1,
-	}
+func newAppUI(a fyne.App, w fyne.Window) *appUI {
+	u := &appUI{fyneApp: a, window: w}
+
+	// Construct canvases with an onChange that marks unsaved state.
+	u.globalCanvas = uicanvas.NewConfigCanvas(func() { u.markUnsaved("global") })
+	u.projectCanvas = uicanvas.NewConfigCanvas(func() { u.markUnsaved("project") })
+
+	return u
 }
 
-// activeConfig returns the config at the top of the navigation stack, or nil.
-func (u *appUI) activeConfig() *config.Config {
-	if len(u.configStack) == 0 {
-		return nil
-	}
-	return u.configStack[len(u.configStack)-1]
+// ── Layout ─────────────────────────────────────────────────────────────────────
+
+// buildLayout assembles the complete window content:
+//
+//	Border(top=nil, bottom=statusBar, left=libraryPanel, right=nil, center=split)
+//	  split = HSplit(globalPanel, projectPanel)
+func (u *appUI) buildLayout() fyne.CanvasObject {
+	// ── Library panel (left, fixed ~200pt) ───────────────────────────────────
+	libPanel := library.NewPanel(func(kind blocks.BlockKind, schemaName string) {
+		// Clicking a library item adds a block to whichever canvas was last active.
+		// For simplicity, we always add to the global canvas here.
+		// Users can also drag blocks directly onto canvases.
+		newBlock := blocks.CreateBlockFromPayload(blocks.DragPayload{
+			Active:     true,
+			Kind:       kind,
+			SchemaName: schemaName,
+		}, func() { u.markUnsaved("global") })
+		if newBlock != nil {
+			u.globalCanvas.AddBlock(newBlock)
+		}
+	})
+
+	// ── Global config panel (centre-left) ────────────────────────────────────
+	globalPanel := u.buildGlobalPanel()
+
+	// ── Project config panel (centre-right) ──────────────────────────────────
+	projectPanel := u.buildProjectPanel()
+
+	// ── Split between the two canvases ───────────────────────────────────────
+	contentSplit := container.NewHSplit(globalPanel, projectPanel)
+	contentSplit.SetOffset(0.5) // 50/50 split
+
+	// ── Library gets a fixed-ish width by putting it in HSplit at 15% ────────
+	outerSplit := container.NewHSplit(libPanel, contentSplit)
+	outerSplit.SetOffset(0.15) // ~15% for the library
+
+	// ── Status bar ───────────────────────────────────────────────────────────
+	u.statusLabel = widget.NewLabel("Ready.")
+	statusBar := container.NewHBox(u.statusLabel)
+
+	return container.NewBorder(nil, statusBar, nil, nil, outerSplit)
 }
 
-// pushConfig parses the file at path and pushes the result onto the stack.
-func (u *appUI) pushConfig(path string) error {
-	// Expand ~ manually — os.Open does not expand shell shortcuts.
+// buildGlobalPanel returns the widget for the global config column.
+func (u *appUI) buildGlobalPanel() fyne.CanvasObject {
+	titleLabel := widget.NewLabel("Global Config: ~/.gitconfig")
+	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	u.saveGlobalBtn = widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
+		u.saveGlobal()
+	})
+
+	header := container.NewBorder(nil, widget.NewSeparator(), nil, u.saveGlobalBtn, titleLabel)
+
+	return container.NewBorder(header, nil, nil, nil, u.globalCanvas)
+}
+
+// buildProjectPanel returns the widget for the project config column.
+func (u *appUI) buildProjectPanel() fyne.CanvasObject {
+	titleLabel := widget.NewLabel("Project Config")
+	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	openBtn := widget.NewButtonWithIcon("Open Project…", theme.FolderOpenIcon(), func() {
+		u.showOpenProjectDialog()
+	})
+
+	u.saveProjectBtn = widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
+		u.saveProject()
+	})
+	u.saveProjectBtn.Disable() // disabled until a project is loaded
+
+	header := container.NewBorder(nil, widget.NewSeparator(), nil,
+		container.NewHBox(openBtn, u.saveProjectBtn),
+		titleLabel,
+	)
+
+	return container.NewBorder(header, nil, nil, nil, u.projectCanvas)
+}
+
+// ── Config loading ─────────────────────────────────────────────────────────────
+
+// loadGlobal parses the file at path and populates the global canvas.
+func (u *appUI) loadGlobal(path string) error {
 	expanded, err := expandHome(path)
 	if err != nil {
 		return err
 	}
 	cfg, err := config.Parse(expanded)
 	if err != nil {
+		// If the file simply doesn't exist, start with an empty canvas.
+		if os.IsNotExist(err) {
+			u.globalPath = expanded
+			u.globalCfg = &config.Config{FilePath: expanded}
+			return nil
+		}
 		return err
 	}
-	u.configStack = append(u.configStack, cfg)
-	u.selectedDisplay = -1
+	u.globalPath = expanded
+	u.globalCfg = cfg
+	loadConfigToCanvas(cfg, u.globalCanvas, func() { u.markUnsaved("global") })
 	return nil
 }
 
-// popConfig navigates back to the parent config.
-func (u *appUI) popConfig() {
-	if len(u.configStack) <= 1 {
-		return
-	}
-	u.configStack = u.configStack[:len(u.configStack)-1]
-	u.selectedDisplay = -1
-}
-
-// visibleSections returns the real section indices (into activeConfig.Sections)
-// of sections that should appear in the sidebar. We skip nameless "preamble"
-// sections — those are just comment holders with no header.
-func (u *appUI) visibleSections() []int {
-	cfg := u.activeConfig()
-	if cfg == nil {
-		return nil
-	}
-	var out []int
-	for i, s := range cfg.Sections {
-		if s.Name != "" {
-			out = append(out, i)
+// loadProject parses the gitconfig at path and populates the project canvas.
+func (u *appUI) loadProject(path string) error {
+	cfg, err := config.Parse(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			u.projectPath = path
+			u.projectCanvas.Clear()
+			return nil
 		}
+		return err
 	}
-	return out
+	u.projectPath = path
+	u.projectCanvas.Clear()
+	loadConfigToCanvas(cfg, u.projectCanvas, func() { u.markUnsaved("project") })
+	u.saveProjectBtn.Enable()
+
+	// After loading the project config, highlight any global keys it overrides.
+	u.updateSupersededKeys(cfg)
+	return nil
 }
 
-// ── Layout ────────────────────────────────────────────────────────────────────
-
-// buildLayout assembles the complete window content.
+// loadConfigToCanvas walks the parsed config sections and creates the
+// appropriate block for each one, then appends it to the canvas.
 //
-// The layout hierarchy is:
-//
-//	Border(top=toolbar, bottom=statusBar, center=HSplit)
-//	  HSplit
-//	    left:  Border(top=listTitle, center=sectionList)
-//	    right: editorHolder  (swapped dynamically on selection)
-func (u *appUI) buildLayout() fyne.CanvasObject {
-	// ── sidebar (left) ────────────────────────────────────────────────────
-	u.sectionList = u.buildSectionList()
+// Logic:
+//   - [includeIf "…"] sections → ConditionalBlock (consecutive ones with the
+//     same path are merged into one block with multiple condition rows)
+//   - [include] sections → FileBlock (loads the included file recursively)
+//   - Everything else → SectionBlock (if in schema) or CustomBlock (if not)
+func loadConfigToCanvas(cfg *config.Config, c *uicanvas.ConfigCanvas, onChange func()) {
+	i := 0
+	for i < len(cfg.Sections) {
+		sec := cfg.Sections[i]
 
-	listTitle := widget.NewLabel("Sections")
-	listTitle.TextStyle = fyne.TextStyle{Bold: true}
+		switch sec.Name {
+		case "includeIf":
+			// Collect all consecutive [includeIf] sections that point to the
+			// same file and merge them into one ConditionalBlock.
+			path := pathValue(sec)
+			var conds []blocks.ConditionRowExport
+			kind, val := blocks.ParseCondition(sec.Subsection)
+			conds = append(conds, blocks.ConditionRowExport{Kind: kind, Value: val})
 
-	// container.NewBorder places items at the cardinal edges and stretches the
-	// center to fill remaining space. Signature: (top, bottom, left, right, center...)
-	leftPanel := container.NewBorder(
-		container.NewVBox(listTitle, widget.NewSeparator()),
-		nil, nil, nil,
-		u.sectionList,
-	)
-
-	// ── editor (right) ────────────────────────────────────────────────────
-	// container.NewStack stacks its children so each fills the whole area.
-	// We use it as a "slot" — when a section is selected we replace its sole
-	// child with a freshly built editor panel.
-	placeholder := widget.NewLabel("← Select a section to edit it")
-	placeholder.Alignment = fyne.TextAlignCenter
-	u.editorHolder = container.NewStack(placeholder)
-
-	// ── split ─────────────────────────────────────────────────────────────
-	split := container.NewHSplit(leftPanel, u.editorHolder)
-	split.SetOffset(0.28) // 28% left, 72% right
-
-	// ── toolbar (top) ─────────────────────────────────────────────────────
-	toolbar := u.buildToolbar()
-
-	// ── status bar (bottom) ───────────────────────────────────────────────
-	u.statusLabel = widget.NewLabel("")
-	statusBar := container.NewHBox(u.statusLabel)
-
-	return container.NewBorder(toolbar, statusBar, nil, nil, split)
-}
-
-// buildToolbar creates the top bar: back button, file path label, and action buttons.
-func (u *appUI) buildToolbar() fyne.CanvasObject {
-	// Back button — only useful when we have drilled into a nested config.
-	u.backBtn = widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
-		u.popConfig()
-		u.refreshAfterNavigation()
-	})
-	u.backBtn.Disable() // disabled initially; enabled when stack depth > 1
-
-	// Path label shows which file we are currently editing.
-	pathText := ""
-	if cfg := u.activeConfig(); cfg != nil {
-		pathText = cfg.FilePath
-	}
-	u.pathLabel = widget.NewLabel(pathText)
-	u.pathLabel.Truncation = fyne.TextTruncateEllipsis
-
-	// Save button — writes the active config to disk atomically.
-	saveBtn := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
-		u.save()
-	})
-
-	// Add Section button — opens a dialog to create a new [section].
-	addSecBtn := widget.NewButtonWithIcon("Add Section", theme.ContentAddIcon(), func() {
-		u.showAddSectionDialog()
-	})
-
-	// container.NewHBox stacks its children horizontally with natural sizing.
-	left := container.NewHBox(u.backBtn, u.pathLabel)
-	right := container.NewHBox(addSecBtn, saveBtn)
-	return container.NewBorder(nil, widget.NewSeparator(), nil, right, left)
-}
-
-// buildSectionList creates the sidebar widget.List.
-//
-// widget.List is Fyne's virtualised list: it creates a small fixed number of
-// row widgets ("templates") and reuses them as the user scrolls.  You drive
-// it with three functions:
-//   - Length() int              — how many rows in total
-//   - CreateItem() CanvasObject — return a fresh template widget
-//   - UpdateItem(id, obj)       — fill the template for row `id`
-func (u *appUI) buildSectionList() *widget.List {
-	list := widget.NewList(
-		func() int {
-			return len(u.visibleSections())
-		},
-		func() fyne.CanvasObject {
-			// The template is a plain Label. Fyne reuses these across rows.
-			return widget.NewLabel("")
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			label := obj.(*widget.Label) // type-assert the template back to *Label
-			vis := u.visibleSections()
-			if id >= len(vis) {
-				return
+			j := i + 1
+			for j < len(cfg.Sections) &&
+				cfg.Sections[j].Name == "includeIf" &&
+				pathValue(cfg.Sections[j]) == path {
+				k2, v2 := blocks.ParseCondition(cfg.Sections[j].Subsection)
+				conds = append(conds, blocks.ConditionRowExport{Kind: k2, Value: v2})
+				j++
 			}
-			sec := u.activeConfig().Sections[vis[id]]
-			label.SetText(sectionLabel(sec))
-		},
-	)
 
-	list.OnSelected = func(id widget.ListItemID) {
-		u.selectedDisplay = id
-		vis := u.visibleSections()
-		if id >= len(vis) {
-			return
+			// Build the child FileBlock for the included file.
+			fb := blocks.NewFileBlock(path, onChange)
+			// Try to load the included file's contents into the FileBlock.
+			loadIncludedFile(path, fb, onChange)
+
+			// Build the ConditionalBlock from exported condition rows.
+			condBlock := blocks.NewConditionalBlockFromExported(conds, fb, onChange)
+			c.AddBlock(condBlock)
+			i = j
+
+		case "include":
+			// Plain [include path=…] → FileBlock
+			path := pathValue(sec)
+			fb := blocks.NewFileBlock(path, onChange)
+			loadIncludedFile(path, fb, onChange)
+			c.AddBlock(fb)
+			i++
+
+		default:
+			// Regular section: look up in schema registry.
+			if s, ok := schema.Lookup(sec.Name); ok {
+				sb := blocks.NewSectionBlock(s, sec.Subsection, sec.Entries, onChange)
+				c.AddBlock(sb)
+			} else {
+				cb := blocks.NewCustomBlock(sec.Name, sec.Subsection, sec.Entries, onChange)
+				c.AddBlock(cb)
+			}
+			i++
 		}
-		sectionIdx := vis[id]
-		u.showSection(sectionIdx)
 	}
-
-	return list
 }
 
-// ── Dynamic editor swapping ───────────────────────────────────────────────────
-
-// showSection rebuilds the right-side editor for the section at sectionIdx
-// (an index into activeConfig().Sections).
-func (u *appUI) showSection(sectionIdx int) {
-	cfg := u.activeConfig()
-	if cfg == nil || sectionIdx >= len(cfg.Sections) {
+// loadIncludedFile attempts to parse the file at rawPath and add its sections
+// as children of the given FileBlock. Errors are silently ignored (the file
+// may not exist or be inaccessible — the user can still edit the path field).
+func loadIncludedFile(rawPath string, fb *blocks.FileBlock, onChange func()) {
+	if rawPath == "" {
 		return
 	}
-	sec := &cfg.Sections[sectionIdx]
-
-	var editor fyne.CanvasObject
-	if isIncludeSection(sec) {
-		editor = buildIncludeEditor(sec, func(linkedPath string) {
-			u.openLinkedConfig(linkedPath)
-		})
-	} else {
-		editor = buildRegularEditor(sec, func() {
-			// Called whenever the editor makes a structural change (add/delete entry)
-			// that requires the editor itself to be rebuilt.
-			u.showSection(sectionIdx)
-		})
-	}
-
-	// Wrap in a scroll view so long sections don't clip.
-	scrolled := container.NewScroll(editor)
-	u.editorHolder.Objects = []fyne.CanvasObject{scrolled}
-	u.editorHolder.Refresh()
-}
-
-// ── Navigation helpers ────────────────────────────────────────────────────────
-
-// openLinkedConfig resolves a path (possibly relative or ~/…) to an absolute
-// path, parses that gitconfig, and navigates into it.
-func (u *appUI) openLinkedConfig(rawPath string) {
-	if err := u.pushConfig(rawPath); err != nil {
-		dialog.ShowError(fmt.Errorf("open %s: %w", rawPath, err), u.window)
+	expanded, err := expandHome(rawPath)
+	if err != nil {
 		return
 	}
-	u.refreshAfterNavigation()
+	subCfg, err := config.Parse(expanded)
+	if err != nil {
+		return // file not found or parse error — silently skip
+	}
+	for _, sec := range subCfg.Sections {
+		if sec.Name == "" {
+			continue // skip preamble comment sections
+		}
+		if s, ok := schema.Lookup(sec.Name); ok {
+			child := blocks.NewSectionBlock(s, sec.Subsection, sec.Entries, onChange)
+			fb.AddChild(child)
+		} else {
+			child := blocks.NewCustomBlock(sec.Name, sec.Subsection, sec.Entries, onChange)
+			fb.AddChild(child)
+		}
+	}
 }
 
-// refreshAfterNavigation repaints the sidebar, toolbar, and clears the editor
-// after the config stack changes (push or pop).
-func (u *appUI) refreshAfterNavigation() {
-	// Update path label.
-	if cfg := u.activeConfig(); cfg != nil {
-		u.pathLabel.SetText(cfg.FilePath)
+// pathValue extracts the "path" entry value from a config.Section.
+func pathValue(sec config.Section) string {
+	for _, e := range sec.Entries {
+		if e.Key == "path" {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// ── Superseded key highlighting ───────────────────────────────────────────────
+
+// updateSupersededKeys compares the project config against the global canvas
+// and marks any global fields that are overridden by the project config.
+//
+// A field is "superseded" when the project config contains the same section
+// name + subsection + key combination.
+func (u *appUI) updateSupersededKeys(projectCfg *config.Config) {
+	// Build a lookup set: "sectionName\x00subsection\x00key" → true
+	superseded := make(map[string]bool)
+	for _, sec := range projectCfg.Sections {
+		for _, e := range sec.Entries {
+			if e.Key != "" {
+				key := sec.Name + "\x00" + sec.Subsection + "\x00" + e.Key
+				superseded[key] = true
+			}
+		}
 	}
 
-	// Enable/disable back button.
-	if len(u.configStack) > 1 {
-		u.backBtn.Enable()
-	} else {
-		u.backBtn.Disable()
+	// Walk the global canvas blocks and mark matching entries.
+	for _, obj := range u.globalCanvas.Blocks() {
+		switch blk := obj.(type) {
+		case *blocks.SectionBlock:
+			for _, entry := range blk.Entries() {
+				key := blk.SectionName() + "\x00" + blk.Subsection() + "\x00" + entry.Key
+				blk.MarkSuperseded(entry.Key, superseded[key])
+			}
+		}
+		// FileBlock and ConditionalBlock children are not checked — they represent
+		// separate files that have their own config scope.
 	}
-
-	// Reset selection and repaint the list.
-	u.selectedDisplay = -1
-	u.sectionList.UnselectAll()
-	u.sectionList.Refresh()
-
-	// Clear the editor pane.
-	placeholder := widget.NewLabel("← Select a section to edit it")
-	placeholder.Alignment = fyne.TextAlignCenter
-	u.editorHolder.Objects = []fyne.CanvasObject{placeholder}
-	u.editorHolder.Refresh()
-
-	u.status("")
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
-// save writes the currently active config to disk.
-func (u *appUI) save() {
-	cfg := u.activeConfig()
-	if cfg == nil {
-		u.status("Nothing to save.")
+// saveGlobal serialises the global canvas back to disk.
+func (u *appUI) saveGlobal() {
+	if u.globalPath == "" {
+		u.status("No global config path — nothing to save.")
 		return
 	}
+	cfg := canvasToConfig(u.globalCanvas, u.globalPath)
 	if err := config.Write(cfg); err != nil {
 		dialog.ShowError(fmt.Errorf("save failed: %w", err), u.window)
-		u.status("❌ Save failed.")
+		u.status("Save failed.")
 		return
 	}
-	u.status("✓ Saved " + cfg.FilePath)
+	u.globalCfg = cfg
+	u.status("Saved " + u.globalPath)
 }
 
-// ── Add Section dialog ────────────────────────────────────────────────────────
+// saveProject serialises the project canvas back to disk.
+func (u *appUI) saveProject() {
+	if u.projectPath == "" {
+		u.status("No project config loaded.")
+		return
+	}
+	cfg := canvasToConfig(u.projectCanvas, u.projectPath)
+	if err := config.Write(cfg); err != nil {
+		dialog.ShowError(fmt.Errorf("save failed: %w", err), u.window)
+		u.status("Save failed.")
+		return
+	}
+	u.status("Saved " + u.projectPath)
+}
 
-// showAddSectionDialog opens a form where the user names a new section.
-//
-// Why dialog.NewCustomConfirm instead of dialog.ShowForm?
-// dialog.ShowForm sizes each widget column to its minimum width — for an empty
-// Entry that is very narrow.  dialog.NewCustomConfirm returns a Dialog value
-// that exposes Resize(), so we can force a sensible width before Show().
-func (u *appUI) showAddSectionDialog() {
-	nameEntry := widget.NewEntry()
-	nameEntry.SetPlaceHolder("e.g. alias, push, pull")
+// canvasToConfig walks the blocks on a canvas and reconstructs a config.Config.
+func canvasToConfig(c *uicanvas.ConfigCanvas, filePath string) *config.Config {
+	cfg := &config.Config{FilePath: filePath}
+	for _, obj := range c.Blocks() {
+		if ser, ok := obj.(blocks.BlockSerializer); ok {
+			cfg.Sections = append(cfg.Sections, ser.ToSections()...)
+		}
+	}
+	return cfg
+}
 
-	subEntry := widget.NewEntry()
-	subEntry.SetPlaceHolder("e.g. lfs  (leave blank for none)")
+// ── Open Project dialog ───────────────────────────────────────────────────────
 
-	// widget.NewForm lays out FormItems in a two-column label/widget grid and
-	// stretches the widget column to fill available horizontal space.
-	form := widget.NewForm(
-		widget.NewFormItem("Section name", nameEntry),
-		widget.NewFormItem("Subsection (optional)", subEntry),
-	)
-
-	d := dialog.NewCustomConfirm("Add Section", "Add", "Cancel", form, func(confirmed bool) {
-		if !confirmed {
+// showOpenProjectDialog opens a folder picker. The selected directory's
+// .git/config is loaded into the project canvas.
+func (u *appUI) showOpenProjectDialog() {
+	d := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil || uri == nil {
 			return
 		}
-		name := strings.TrimSpace(nameEntry.Text)
-		if name == "" {
-			u.status("Section name cannot be empty.")
+		repoPath := uri.Path()
+		gitConfigPath := filepath.Join(repoPath, ".git", "config")
+
+		if loadErr := u.loadProject(gitConfigPath); loadErr != nil {
+			dialog.ShowError(
+				fmt.Errorf("could not load %s:\n%w", gitConfigPath, loadErr),
+				u.window,
+			)
 			return
 		}
-		sub := strings.TrimSpace(subEntry.Text)
 
-		cfg := u.activeConfig()
-		cfg.Sections = append(cfg.Sections, config.Section{
-			Name:       name,
-			Subsection: sub,
-		})
-
-		// Repaint the sidebar to include the new section.
-		u.sectionList.Refresh()
-
-		// Auto-select the new section so the user sees its (empty) editor.
-		vis := u.visibleSections()
-		newDisplayIdx := len(vis) - 1
-		u.sectionList.Select(newDisplayIdx)
-		u.status(fmt.Sprintf("Added [%s].", sectionLabel(config.Section{Name: name, Subsection: sub})))
+		u.status("Loaded project: " + repoPath)
+		u.addRecentRepo(repoPath)
 	}, u.window)
-
-	// Resize before Show — the entries now stretch to fill the 420 pt width.
-	d.Resize(fyne.NewSize(420, 180))
 	d.Show()
 }
 
-// ── Status bar ────────────────────────────────────────────────────────────────
+// ── Recent repos ──────────────────────────────────────────────────────────────
 
+// addRecentRepo prepends repoPath to the persisted recent-repos list, keeping
+// at most 5 entries.
+func (u *appUI) addRecentRepo(repoPath string) {
+	prefs := u.fyneApp.Preferences()
+	existing := prefs.StringList("recentRepos")
+
+	// Remove any existing occurrence of this path (dedup).
+	var filtered []string
+	for _, p := range existing {
+		if p != repoPath {
+			filtered = append(filtered, p)
+		}
+	}
+
+	// Prepend the new path.
+	updated := append([]string{repoPath}, filtered...)
+
+	// Keep at most 5 recent repos.
+	if len(updated) > 5 {
+		updated = updated[:5]
+	}
+
+	prefs.SetStringList("recentRepos", updated)
+}
+
+// recentRepos returns the stored list of recent repository paths.
+func (u *appUI) recentRepos() []string {
+	return u.fyneApp.Preferences().StringList("recentRepos")
+}
+
+// ── Status bar helpers ────────────────────────────────────────────────────────
+
+// markUnsaved is called by canvas onChange callbacks to indicate unsaved changes.
+func (u *appUI) markUnsaved(which string) {
+	u.status("Unsaved changes in " + which + " config.")
+}
+
+// status updates the bottom status bar message.
 func (u *appUI) status(msg string) {
-	u.statusLabel.SetText(msg)
+	if u.statusLabel != nil {
+		u.statusLabel.SetText(msg)
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// sectionLabel formats a config.Section for display in the sidebar.
-// Examples: "user", "core", "filter · lfs", "includeIf · gitdir:~/work/"
-func sectionLabel(s config.Section) string {
-	if s.Subsection == "" {
-		return s.Name
-	}
-	return s.Name + " · " + s.Subsection
-}
-
-// isIncludeSection reports whether a section is [include] or [includeIf …].
-// These sections are handled differently in the editor because their purpose
-// is to link to another file, not to hold key=value configuration.
-func isIncludeSection(s *config.Section) bool {
-	return s.Name == "include" || s.Name == "includeIf"
-}
-
 // expandHome replaces a leading ~ with the user's home directory.
-// Go's standard library does not do this automatically; only shells do.
+// The Go standard library does not expand shell shortcuts automatically.
 func expandHome(path string) (string, error) {
 	if !strings.HasPrefix(path, "~") {
 		return path, nil
