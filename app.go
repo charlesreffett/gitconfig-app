@@ -151,7 +151,7 @@ func (a *App) LoadConfig(path string) ([]BlockDTO, error) {
 		}
 		return nil, err
 	}
-	return sectionsToBlocks(cfg.Sections), nil
+	return sectionsToBlocks(cfg.Sections, filepath.Dir(expanded)), nil
 }
 
 // SaveConfig converts blocks back to config sections and writes the file
@@ -171,18 +171,18 @@ func (a *App) SaveConfig(path string, blocks []BlockDTO) error {
 	if err := config.Write(cfg); err != nil {
 		return err
 	}
-	return saveIncludedFiles(blocks)
+	return saveIncludedFiles(blocks, filepath.Dir(expanded))
 }
 
 // saveIncludedFiles writes the (editable) children of every file/conditional
 // block back to the file they were loaded from. Blocks with no children are
 // skipped so a missing or unreadable include target is never created or wiped.
-func saveIncludedFiles(blocks []BlockDTO) error {
+func saveIncludedFiles(blocks []BlockDTO, baseDir string) error {
 	for _, b := range blocks {
 		if (b.Type != "file" && b.Type != "conditional") || b.Path == "" || len(b.Children) == 0 {
 			continue
 		}
-		expanded, err := expandHome(b.Path)
+		expanded, err := resolveIncludePath(b.Path, baseDir)
 		if err != nil {
 			return err
 		}
@@ -319,7 +319,7 @@ func (a *App) AddRecentRepo(repoPath string) {
 
 // sectionsToBlocks converts parsed config sections into the block tree that the
 // frontend renders. This mirrors the loadConfigToCanvas logic from the old UI.
-func sectionsToBlocks(sections []config.Section) []BlockDTO {
+func sectionsToBlocks(sections []config.Section, baseDir string) []BlockDTO {
 	var blocks []BlockDTO
 	i := 0
 	for i < len(sections) {
@@ -347,7 +347,7 @@ func sectionsToBlocks(sections []config.Section) []BlockDTO {
 				Type:       "conditional",
 				Conditions: conds,
 				Path:       path,
-				Children:   loadIncludedFileBlocks(path),
+				Children:   loadIncludedFileBlocks(path, baseDir),
 			})
 			i = j
 
@@ -357,7 +357,7 @@ func sectionsToBlocks(sections []config.Section) []BlockDTO {
 				ID:       newID(),
 				Type:     "file",
 				Path:     path,
-				Children: loadIncludedFileBlocks(path),
+				Children: loadIncludedFileBlocks(path, baseDir),
 			})
 			i++
 
@@ -442,11 +442,11 @@ func blocksToSections(blocks []BlockDTO) []config.Section {
 // loadIncludedFileBlocks parses rawPath and returns its sections as blocks.
 // Errors (missing file, parse failure) are silently ignored — the file may
 // not exist yet or be temporarily inaccessible.
-func loadIncludedFileBlocks(rawPath string) []BlockDTO {
+func loadIncludedFileBlocks(rawPath, baseDir string) []BlockDTO {
 	if rawPath == "" {
 		return nil
 	}
-	expanded, err := expandHome(rawPath)
+	expanded, err := resolveIncludePath(rawPath, baseDir)
 	if err != nil {
 		return nil
 	}
@@ -544,6 +544,21 @@ func parseCondition(subsection string) (kind, value string) {
 		return subsection, ""
 	}
 	return subsection[:idx], subsection[idx+1:]
+}
+
+// resolveIncludePath turns an include.path / includeIf.path value into a
+// filesystem path the way git does: "~" expands to the home directory and a
+// relative path is resolved against baseDir, the directory of the config file
+// that contains the include. An empty baseDir leaves relative paths as-is.
+func resolveIncludePath(raw, baseDir string) (string, error) {
+	expanded, err := expandHome(raw)
+	if err != nil {
+		return "", err
+	}
+	if baseDir != "" && !filepath.IsAbs(expanded) {
+		expanded = filepath.Join(baseDir, expanded)
+	}
+	return expanded, nil
 }
 
 func expandHome(path string) (string, error) {

@@ -13,7 +13,7 @@ import (
 // ── sectionsToBlocks ──────────────────────────────────────────────────────────
 
 func TestSectionsToBlocks_Empty(t *testing.T) {
-	if got := sectionsToBlocks(nil); len(got) != 0 {
+	if got := sectionsToBlocks(nil, ""); len(got) != 0 {
 		t.Fatalf("expected 0 blocks, got %d", len(got))
 	}
 }
@@ -25,7 +25,7 @@ func TestSectionsToBlocks_KnownSection(t *testing.T) {
 			{Key: "email", Value: "alice@example.com"},
 		}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -48,7 +48,7 @@ func TestSectionsToBlocks_UnknownSection(t *testing.T) {
 	sections := []config.Section{
 		{Name: "myplugin", Entries: []config.Entry{{Key: "opt", Value: "val"}}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -66,7 +66,7 @@ func TestSectionsToBlocks_Subsection(t *testing.T) {
 			{Key: "rebase", Value: "true"},
 		}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if blocks[0].Subsection != "main" {
 		t.Errorf("Subsection = %q; want \"main\"", blocks[0].Subsection)
 	}
@@ -76,7 +76,7 @@ func TestSectionsToBlocks_Include(t *testing.T) {
 	sections := []config.Section{
 		{Name: "include", Entries: []config.Entry{{Key: "path", Value: "~/.gitconfig_extra"}}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block, got %d", len(blocks))
 	}
@@ -96,7 +96,7 @@ func TestSectionsToBlocks_IncludeIfMerged(t *testing.T) {
 		{Name: "includeIf", Subsection: "gitdir:~/work/", Entries: []config.Entry{{Key: "path", Value: "~/.gitconfig_work"}}},
 		{Name: "includeIf", Subsection: "gitdir:~/work/**", Entries: []config.Entry{{Key: "path", Value: "~/.gitconfig_work"}}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 merged ConditionalBlock, got %d", len(blocks))
 	}
@@ -124,7 +124,7 @@ func TestSectionsToBlocks_IncludeIfNotMergedDifferentPaths(t *testing.T) {
 		{Name: "includeIf", Subsection: "gitdir:~/work/", Entries: []config.Entry{{Key: "path", Value: "~/.gitconfig_work"}}},
 		{Name: "includeIf", Subsection: "gitdir:~/home/", Entries: []config.Entry{{Key: "path", Value: "~/.gitconfig_home"}}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 2 {
 		t.Fatalf("expected 2 blocks for different paths, got %d", len(blocks))
 	}
@@ -139,7 +139,7 @@ func TestSectionsToBlocks_SkipsPreamble(t *testing.T) {
 		{Name: "", Entries: []config.Entry{{RawLine: "# top comment"}}},
 		{Name: "user", Entries: []config.Entry{{Key: "name", Value: "Bob"}}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 block (preamble skipped), got %d", len(blocks))
 	}
@@ -156,7 +156,7 @@ func TestSectionsToBlocks_SkipsCommentEntries(t *testing.T) {
 			{Key: "autocrlf", Value: "input"},
 		}},
 	}
-	blocks := sectionsToBlocks(sections)
+	blocks := sectionsToBlocks(sections, "")
 	if len(blocks[0].Entries) != 1 {
 		t.Errorf("expected 1 kv entry, got %d", len(blocks[0].Entries))
 	}
@@ -297,7 +297,7 @@ func TestRoundTrip_SectionsToBlocksAndBack(t *testing.T) {
 			Entries: []config.Entry{{Key: "path", Value: "~/.extra"}}},
 	}
 
-	blocks := sectionsToBlocks(original)
+	blocks := sectionsToBlocks(original, "")
 	recovered := blocksToSections(blocks)
 
 	if len(recovered) != len(original) {
@@ -564,5 +564,72 @@ func TestSaveConfig_SkipsIncludeWithoutChildren(t *testing.T) {
 	}
 	if _, err := os.Stat(incPath); !os.IsNotExist(err) {
 		t.Errorf("included file should not be created")
+	}
+}
+
+// ── Relative include paths ───────────────────────────────────────────────────
+
+func TestResolveIncludePath(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	cases := []struct{ raw, base, want string }{
+		{"config/.gitconfig_work", "/home/me", "/home/me/config/.gitconfig_work"},
+		{"../shared.inc", "/repo/.git", "/repo/shared.inc"},
+		{"/abs/file", "/home/me", "/abs/file"},
+		{"~/configs/work", "/elsewhere", filepath.Join(home, "configs/work")},
+		{"relative/path", "", "relative/path"},
+	}
+	for _, c := range cases {
+		got, err := resolveIncludePath(c.raw, c.base)
+		if err != nil {
+			t.Fatalf("resolveIncludePath(%q, %q): %v", c.raw, c.base, err)
+		}
+		if got != c.want {
+			t.Errorf("resolveIncludePath(%q, %q) = %q; want %q", c.raw, c.base, got, c.want)
+		}
+	}
+}
+
+func TestLoadAndSave_RelativeIncludePath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainPath := filepath.Join(dir, "gitconfig")
+	incPath := filepath.Join(dir, "config", ".gitconfig_work")
+	if err := os.WriteFile(incPath, []byte("[user]\n\temail = old@example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainCfg := "[includeIf \"gitdir:~/work/\"]\n\tpath = config/.gitconfig_work\n"
+	if err := os.WriteFile(mainPath, []byte(mainCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run from a different cwd to prove resolution doesn't depend on it.
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &App{}
+	blocks, err := a.LoadConfig(mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || len(blocks[0].Children) != 1 {
+		t.Fatalf("relative include not loaded: %+v", blocks)
+	}
+	blocks[0].Children[0].Entries[0].Value = "new@example.com"
+	if err := a.SaveConfig(mainPath, blocks); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := os.ReadFile(incPath)
+	if !strings.Contains(string(got), "email = new@example.com") {
+		t.Errorf("included file not updated:\n%s", got)
+	}
+	mainGot, _ := os.ReadFile(mainPath)
+	if !strings.Contains(string(mainGot), "path = config/.gitconfig_work") {
+		t.Errorf("main config should keep the relative path as written:\n%s", mainGot)
 	}
 }
