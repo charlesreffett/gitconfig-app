@@ -125,12 +125,37 @@ export const useAppStore = defineStore('app', () => {
 
   async function resetGlobal() {
     if (!globalPath.value) return
-    await loadGlobal(globalPath.value)
+    try {
+      const dtos = await LoadConfig(globalPath.value)
+      // Don't wipe the canvas if the backend returned nothing — that signals
+      // a transient failure (bridge reload, missing file) rather than an
+      // intentional empty config.
+      if (dtos.length === 0 && globalBlocks.value.length > 0) {
+        setStatus('Reset skipped: file appears empty or unavailable')
+        return
+      }
+      globalBlocks.value = dtos.map(dtoToBlock)
+      globalUnsaved.value = false
+      setStatus('Reverted to saved: ' + globalPath.value)
+    } catch (e: any) {
+      setStatus('Reset failed: ' + e)
+    }
   }
 
   async function resetProject() {
     if (!projectPath.value) return
-    await loadProject(projectPath.value)
+    try {
+      const dtos = await LoadConfig(projectPath.value)
+      if (dtos.length === 0 && projectBlocks.value.length > 0) {
+        setStatus('Reset skipped: file appears empty or unavailable')
+        return
+      }
+      projectBlocks.value = dtos.map(dtoToBlock)
+      projectUnsaved.value = false
+      setStatus('Reverted to saved: ' + projectPath.value)
+    } catch (e: any) {
+      setStatus('Reset failed: ' + e)
+    }
   }
 
   function markGlobalUnsaved() { globalUnsaved.value = true }

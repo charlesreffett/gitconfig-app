@@ -33,7 +33,7 @@ async function loadRecentProject(repoPath: string) {
       <!-- macOS traffic light space -->
       <div class="w-16 shrink-0 no-drag" />
 
-      <h1 class="font-semibold text-sm no-drag">Git Config Manager</h1>
+      <h1 class="font-semibold text-sm">Git Config Manager</h1>
 
       <div class="flex-1" />
 

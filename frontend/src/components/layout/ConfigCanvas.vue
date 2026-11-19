@@ -4,6 +4,7 @@ import SectionBlock from '@/components/blocks/SectionBlock.vue'
 import FileBlock from '@/components/blocks/FileBlock.vue'
 import ConditionalBlock from '@/components/blocks/ConditionalBlock.vue'
 import CustomBlock from '@/components/blocks/CustomBlock.vue'
+import { Button } from '@/components/ui/button'
 import type { Block } from '@/types'
 
 const props = defineProps<{
@@ -20,8 +21,24 @@ const props = defineProps<{
   onChange: () => void
 }>()
 
-function removeBlock(idx: number) {
-  props.blocks.splice(idx, 1)
+
+/** Remove a block by stable ID (not positional index, which can be stale). */
+function removeBlock(id: string) {
+  const idx = props.blocks.findIndex(b => b.id === id)
+  if (idx !== -1) {
+    props.blocks.splice(idx, 1)
+    props.onChange()
+  }
+}
+
+/**
+ * VueDraggable emits update:modelValue after a drag reorder.
+ * We cannot reassign props.blocks (Vue 3 prop is readonly), so we
+ * splice-in-place to keep the same Pinia array reference while
+ * reflecting the new sort order.
+ */
+function onDragUpdate(newList: Block[]) {
+  props.blocks.splice(0, props.blocks.length, ...newList)
   props.onChange()
 }
 </script>
@@ -35,32 +52,32 @@ function removeBlock(idx: number) {
         <p class="text-xs text-muted-foreground truncate">{{ configPath || 'No file loaded' }}</p>
       </div>
 
-      <button
+      <Button
         v-if="onOpenProject"
-        class="h-7 px-3 rounded text-xs border border-input bg-background hover:bg-accent transition-colors"
+        variant="outline"
+        class="h-7 px-3 text-xs"
         @click="onOpenProject"
       >
         Open Project…
-      </button>
+      </Button>
 
-      <button
-        class="h-7 px-3 rounded text-xs font-medium transition-colors border border-input bg-background hover:bg-accent disabled:opacity-40 disabled:cursor-not-allowed"
+      <Button
+        variant="outline"
+        class="h-7 px-3 text-xs"
         :disabled="!unsaved"
         @click="onReset"
       >
         Reset
-      </button>
+      </Button>
 
-      <button
-        class="h-7 px-3 rounded text-xs font-medium transition-colors"
-        :class="unsaved
-          ? 'bg-primary text-primary-foreground hover:bg-primary/90'
-          : 'bg-secondary text-secondary-foreground hover:bg-secondary/80'"
+      <Button
+        class="h-7 px-3 text-xs font-medium"
+        :variant="unsaved ? 'default' : 'secondary'"
         :disabled="!unsaved"
         @click="onSave"
       >
         {{ unsaved ? 'Save*' : 'Saved' }}
-      </button>
+      </Button>
     </div>
 
     <!-- Recent repos (project panel only, when no project loaded) -->
@@ -84,32 +101,32 @@ function removeBlock(idx: number) {
     <!-- Block list -->
     <div class="flex-1 overflow-y-auto min-h-0 px-4 py-3">
       <VueDraggable
-        v-model="props.blocks"
+        :model-value="props.blocks"
         handle=".drag-handle"
         :animation="150"
         ghost-class="opacity-40"
         class="space-y-3"
-        @change="onChange"
+        @update:model-value="onDragUpdate"
       >
-        <template v-for="(block, idx) in props.blocks" :key="block.id">
+        <template v-for="block in props.blocks" :key="block.id">
           <SectionBlock
             v-if="block.type === 'section'"
             :block="block"
             :superseded-keys="supersededKeys"
-            :on-remove="() => removeBlock(idx)"
+            :on-remove="() => removeBlock(block.id)"
             :on-change="onChange"
           />
           <CustomBlock
             v-else-if="block.type === 'custom'"
             :block="block"
-            :on-remove="() => removeBlock(idx)"
+            :on-remove="() => removeBlock(block.id)"
             :on-change="onChange"
           />
           <FileBlock
             v-else-if="block.type === 'file'"
             :block="block"
             :superseded-keys="supersededKeys"
-            :on-remove="() => removeBlock(idx)"
+            :on-remove="() => removeBlock(block.id)"
             :on-change="onChange"
             :draggable="true"
           />
@@ -117,7 +134,7 @@ function removeBlock(idx: number) {
             v-else-if="block.type === 'conditional'"
             :block="block"
             :superseded-keys="supersededKeys"
-            :on-remove="() => removeBlock(idx)"
+            :on-remove="() => removeBlock(block.id)"
             :on-change="onChange"
           />
         </template>
