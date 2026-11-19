@@ -168,7 +168,91 @@ func (a *App) SaveConfig(path string, blocks []BlockDTO) error {
 		FilePath: expanded,
 		Sections: blocksToSections(blocks),
 	}
-	return config.Write(cfg)
+	if err := config.Write(cfg); err != nil {
+		return err
+	}
+	return saveIncludedFiles(blocks)
+}
+
+// saveIncludedFiles writes the (editable) children of every file/conditional
+// block back to the file they were loaded from. Blocks with no children are
+// skipped so a missing or unreadable include target is never created or wiped.
+func saveIncludedFiles(blocks []BlockDTO) error {
+	for _, b := range blocks {
+		if (b.Type != "file" && b.Type != "conditional") || b.Path == "" || len(b.Children) == 0 {
+			continue
+		}
+		expanded, err := expandHome(b.Path)
+		if err != nil {
+			return err
+		}
+		existing, err := config.Parse(expanded)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+			existing = &config.Config{}
+		}
+		cfg := &config.Config{
+			FilePath: expanded,
+			Sections: mergeIncludedSections(existing.Sections, blocksToSections(b.Children)),
+		}
+		if err := config.Write(cfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeIncludedSections rebuilds an included file from edited sections while
+// keeping the original preamble and in-section comments. loadIncludedFileBlocks
+// maps each named section to one child block in order, so sections are matched
+// by position.
+func mergeIncludedSections(old, edited []config.Section) []config.Section {
+	var out []config.Section
+	var named []config.Section
+	for _, s := range old {
+		if s.Name == "" {
+			out = append(out, s) // preamble comments
+		} else {
+			named = append(named, s)
+		}
+	}
+	for i, sec := range edited {
+		if i < len(named) && strings.EqualFold(named[i].Name, sec.Name) {
+			sec.Entries = mergeEntries(named[i].Entries, sec.Entries)
+		}
+		out = append(out, sec)
+	}
+	return out
+}
+
+// mergeEntries keeps comment/blank lines from old in place and substitutes
+// keyed entries positionally from edited. Extra edited entries are appended
+// before any trailing blank lines; surplus old keyed entries are dropped.
+func mergeEntries(old, edited []config.Entry) []config.Entry {
+	var out []config.Entry
+	k := 0
+	for _, e := range old {
+		if e.Key == "" {
+			out = append(out, e)
+			continue
+		}
+		if k < len(edited) {
+			out = append(out, edited[k])
+			k++
+		}
+	}
+	if k < len(edited) {
+		// Insert remaining entries before trailing blank lines.
+		cut := len(out)
+		for cut > 0 && out[cut-1].Key == "" && strings.TrimSpace(out[cut-1].RawLine) == "" {
+			cut--
+		}
+		tail := append([]config.Entry{}, out[cut:]...)
+		out = append(append(out[:cut], edited[k:]...), tail...)
+	}
+	return out
 }
 
 // GetSchema returns the full list of known section schemas.
@@ -334,7 +418,7 @@ func blocksToSections(blocks []BlockDTO) []config.Section {
 					Entries: []config.Entry{{Key: "path", Value: b.Path}},
 				})
 			}
-			// Children live in the included file — not written to this config.
+			// Children live in the included file — written by saveIncludedFiles.
 
 		case "conditional":
 			// Each condition row becomes one [includeIf] section pointing to the

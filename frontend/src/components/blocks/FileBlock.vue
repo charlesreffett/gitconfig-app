@@ -47,7 +47,7 @@ const props = defineProps<{
       />
     </div>
 
-    <!-- Child blocks (read-only view of included file) -->
+    <!-- Child blocks (edits saved back to the included file) -->
     <div v-if="block.children.length > 0" class="px-3 py-2 space-y-2">
       <p class="text-xs text-muted-foreground uppercase tracking-wide font-medium pb-1">Included file contents</p>
       <template v-for="child in block.children" :key="child.id">

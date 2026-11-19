@@ -59,7 +59,7 @@ function makeConditionalBlock(): Block {
     subsection: '',
     entries: [],
     path: '',       // path to the included file lives directly on the block
-    children: [],   // parsed contents of the included file (read-only, from backend)
+    children: [],   // parsed contents of the included file (from backend; edits saved back to that file)
     conditions: [cond],
     file: null,
   }

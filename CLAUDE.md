@@ -51,7 +51,7 @@ Built with **Wails v2** (Go backend, Vue 3 frontend running in a native OS webvi
 
 The UI represents a gitconfig as a tree of typed **blocks**:
 - `SectionBlock` — known sections (`[user]`, `[core]`, etc.) with schema-typed field rows
-- `FileBlock` — an `[include]` or `[includeIf]` target file, shows child section blocks read-only
+- `FileBlock` — an `[include]` or `[includeIf]` target file, shows child section blocks; edits to them are written back to the included file on save
 - `ConditionalBlock` — one or more `[includeIf "condition:value"]` entries, wraps a `FileBlock`
 - `CustomBlock` — unknown sections, free key=value pairs
 

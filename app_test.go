@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -500,5 +502,67 @@ func TestGetConditionTypes_ContainsStandardTypes(t *testing.T) {
 		if !found[r] {
 			t.Errorf("missing condition type %q in %v", r, types)
 		}
+	}
+}
+
+// ── SaveConfig: included file children ───────────────────────────────────────
+
+func TestSaveConfig_WritesIncludedFileChildren(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "gitconfig")
+	incPath := filepath.Join(dir, "gitconfig_work")
+
+	inc := "# work identity\n[user]\n\tname = bob\n\t# keep me\n\temail = old@example.com\n"
+	if err := os.WriteFile(incPath, []byte(inc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainCfg := "[includeIf \"gitdir:~/work/\"]\n\tpath = " + incPath + "\n"
+	if err := os.WriteFile(mainPath, []byte(mainCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &App{}
+	blocks, err := a.LoadConfig(mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || len(blocks[0].Children) != 1 {
+		t.Fatalf("unexpected blocks: %+v", blocks)
+	}
+	for i, e := range blocks[0].Children[0].Entries {
+		if e.Key == "email" {
+			blocks[0].Children[0].Entries[i].Value = "new@example.com"
+		}
+	}
+	if err := a.SaveConfig(mainPath, blocks); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(incPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	for _, want := range []string{"email = new@example.com", "# work identity", "# keep me", "name = bob"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("included file missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "old@example.com") {
+		t.Errorf("old email still present:\n%s", s)
+	}
+}
+
+func TestSaveConfig_SkipsIncludeWithoutChildren(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "gitconfig")
+	incPath := filepath.Join(dir, "missing")
+	a := &App{}
+	err := a.SaveConfig(mainPath, []BlockDTO{{ID: "1", Type: "file", Path: incPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(incPath); !os.IsNotExist(err) {
+		t.Errorf("included file should not be created")
 	}
 }
